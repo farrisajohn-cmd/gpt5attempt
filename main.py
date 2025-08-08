@@ -36,7 +36,7 @@ def monthly_p_and_i(principal: Decimal, annual_rate_pct: Decimal) -> Decimal:
     return principal * r * factor / (factor - Decimal(1))
 
 def choose_rate(fico: int) -> Decimal:
-    # simple rate table for now
+    # Current table per your spec: all buckets 6.125%
     return Decimal("6.125")
 
 # ---------- Models ----------
@@ -48,11 +48,13 @@ class QuoteIn(BaseModel):
     monthly_taxes: Decimal
     monthly_insurance: Decimal
     hoa: Decimal | None = Decimal("0")
+    # NEW: optional lender credit percent (e.g., 1, 2, 3)
+    lender_credit_percent: Decimal | None = None
 
 class QuoteOut(BaseModel):
     output_markdown: str
 
-# ---------- Test route ----------
+# ---------- Health route ----------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
@@ -69,18 +71,22 @@ def fha_quote(payload: QuoteIn):
 
     rate = choose_rate(payload.fico)
 
-    # interim interest: daily × 15
+    # Step 3 – interim interest: daily × 15 (no pre-round)
     daily_interest = final_loan * (rate / Decimal(100)) / Decimal(365)
     interim_interest = daily_interest * Decimal(15)
 
+    # Step 4 – monthly MIP
     mip = final_loan * Decimal("0.0055") / Decimal(12)
+
+    # P&I (30-yr)
     p_i = monthly_p_and_i(final_loan, rate)
 
-    hoa = d(payload.hoa or 0)
-    pitia = p_i + mip + d(payload.monthly_taxes) + d(payload.monthly_insurance) + hoa
+    hoa_amt = d(payload.hoa or 0)
+    pitia = p_i + mip + d(payload.monthly_taxes) + d(payload.monthly_insurance) + hoa_amt
 
-    # Box sums
+    # Step 6 – itemized boxes
     box_a = Decimal("0.00")
+
     b_appraisal, b_credit, b_flood = Decimal("650"), Decimal("100"), Decimal("30")
     box_b = b_appraisal + b_credit + b_flood + ufmip
 
@@ -95,7 +101,28 @@ def fha_quote(payload: QuoteIn):
     box_g = (d(payload.monthly_taxes) * Decimal(3)) + (d(payload.monthly_insurance) * Decimal(3))
 
     total_closing = box_b + box_c + box_e + box_f + box_g
-    cash_to_close = dp + total_closing
+
+    # --- NEW: lender credit application (placeholder logic) ---
+    credit_amt = Decimal("0")
+    if payload.lender_credit_percent is not None:
+        # credit = % of final loan, capped at total closing costs
+        credit_amt = (final_loan * (d(payload.lender_credit_percent) / Decimal(100)))
+        if credit_amt > total_closing:
+            credit_amt = total_closing
+
+    net_closing = total_closing - credit_amt
+
+    # Step 7 – cash to close (never below required down payment)
+    cash_to_close = dp + net_closing
+    if cash_to_close < dp:
+        cash_to_close = dp
+
+    # Build markdown output (keep order/format per your spec)
+    # NOTE: we keep the same $xx.xx format (no commas) to match your previous output exactly.
+    credit_line = (
+        f"**lender credit ({q2(payload.lender_credit_percent)}%):** -${q2(credit_amt)}\n"
+        if payload.lender_credit_percent is not None else ""
+    )
 
     md = f"""🧾 **FHA Loan Estimate — govies.com**
 
@@ -113,10 +140,9 @@ def fha_quote(payload: QuoteIn):
 **box f – prepaids:** ${q2(box_f)}
 **box g – escrow:** ${q2(box_g)}
 **total closing costs:** ${q2(total_closing)}
-
-**💵 calculating cash to close**
+{credit_line}**💵 calculating cash to close**
 **down payment:** ${q2(dp)}
-**closing costs:** ${q2(total_closing)}
+**closing costs:** ${q2(net_closing)}
 **estimated cash to close:** ${q2(cash_to_close)}
 
 please review this estimate and consult with us if you'd like to move forward.
