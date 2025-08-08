@@ -1,12 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 
 app = FastAPI()
 getcontext().prec = 28  # high precision for exact math
 
-# --- CORS: add your domains ---
+# --- CORS: allow frontend origins ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -21,21 +21,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- Decimal helpers ----------
 TWOPL = Decimal("0.01")
 def d(x): return x if isinstance(x, Decimal) else Decimal(str(x))
 def q2(x): return d(x).quantize(TWOPL, rounding=ROUND_HALF_UP)
 
+# ---------- Mortgage calculations ----------
 def monthly_p_and_i(principal: Decimal, annual_rate_pct: Decimal) -> Decimal:
     r = (annual_rate_pct / Decimal(100)) / Decimal(12)
     n = Decimal(360)
-    if r == 0: return principal / n
+    if r == 0:
+        return principal / n
     factor = (Decimal(1) + r) ** n
     return principal * r * factor / (factor - Decimal(1))
 
 def choose_rate(fico: int) -> Decimal:
-    # your current table: all buckets 6.125%
+    # simple rate table for now
     return Decimal("6.125")
 
+# ---------- Models ----------
 class QuoteIn(BaseModel):
     purchase_price: Decimal
     down_payment_value: Decimal
@@ -48,6 +52,12 @@ class QuoteIn(BaseModel):
 class QuoteOut(BaseModel):
     output_markdown: str
 
+# ---------- Test route ----------
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
+# ---------- FHA Quote route ----------
 @app.post("/fha-quote", response_model=QuoteOut)
 def fha_quote(payload: QuoteIn):
     price = d(payload.purchase_price)
@@ -59,7 +69,7 @@ def fha_quote(payload: QuoteIn):
 
     rate = choose_rate(payload.fico)
 
-    # interim interest: daily × 15 (no pre-round)
+    # interim interest: daily × 15
     daily_interest = final_loan * (rate / Decimal(100)) / Decimal(365)
     interim_interest = daily_interest * Decimal(15)
 
