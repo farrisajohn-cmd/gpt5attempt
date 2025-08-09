@@ -75,7 +75,7 @@ def monthly_p_and_i(principal: Decimal, annual_rate_pct: Decimal) -> Decimal:
     return principal * r * factor / (factor - Decimal(1))
 
 def choose_rate(fico: int) -> Decimal:
-    return Decimal("6.125")  # update if you want rate table
+    return Decimal("6.125")  # update if needed
 
 # ---------- endpoint ----------
 @app.get("/ping")
