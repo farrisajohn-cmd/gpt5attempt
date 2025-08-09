@@ -7,17 +7,18 @@ import re
 
 app = FastAPI()
 
+# CORS (keep open; tighten later if you like)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- helpers ----------
+# ----------------- Helpers -----------------
 TWOPL = Decimal("0.01")
-_num_pat = re.compile(r"-?\d+(\.\d+)?")
+_NUM_PAT = re.compile(r"-?\d+(\.\d+)?")
 
 def q2(x: Decimal) -> Decimal:
     return x.quantize(TWOPL, rounding=ROUND_HALF_UP)
@@ -27,30 +28,22 @@ def fmt_currency(x: Decimal) -> str:
 
 def parse_number(x) -> Decimal:
     """
-    Accepts '$350k', '350k', '1.2m', '350,000', '100', 'no', 'none', '', etc.
+    Accepts '$350k', '350k', '1.2m', '350,000', '100', 0, False, None,
+    'no', 'none', 'no hoa', 'null', arrays/objects (treated as 0).
     """
-    if x is None:
+    if x in (None, "", 0, 0.0, False, [], {}, ()):
         return Decimal("0")
     if isinstance(x, (int, float, Decimal)):
         return Decimal(str(x))
-
     s = str(x).strip().lower()
-    if s in {"no", "none", "no hoa", ""}:
+    if s in {"no", "none", "no hoa", "n/a", "na", "nil", "null"}:
         return Decimal("0")
-
     s = s.replace("$", "").replace(",", "").replace(" ", "")
-
     mult = Decimal("1")
-    if s.endswith("k"):
-        mult = Decimal("1000")
-        s = s[:-1]
-    elif s.endswith("m"):
-        mult = Decimal("1000000")
-        s = s[:-1]
-
-    if not _num_pat.fullmatch(s or "0"):
-        raise ValueError(f"invalid numeric value: {x}")
-
+    if s.endswith("k"): mult = Decimal("1000"); s = s[:-1]
+    elif s.endswith("m"): mult = Decimal("1000000"); s = s[:-1]
+    if not _NUM_PAT.fullmatch(s or "0"):
+        return Decimal("0")  # soft-fail to zero
     return Decimal(s) * mult
 
 def parse_percent_or_number(x) -> Decimal:
@@ -67,11 +60,9 @@ def parse_bool_soft(x) -> Optional[bool]:
     if isinstance(x, bool):
         return x
     s = str(x).strip().lower()
-    if s in {"true", "t", "yes", "y", "1"}:
-        return True
-    if s in {"false", "f", "no", "n", "0"}:
-        return False
-    return None  # unknown
+    if s in {"true", "t", "yes", "y", "1"}: return True
+    if s in {"false", "f", "no", "n", "0"}: return False
+    return None
 
 def monthly_p_and_i(principal: Decimal, annual_rate_pct: Decimal) -> Decimal:
     r = (annual_rate_pct / Decimal("100")) / Decimal("12")
@@ -82,49 +73,32 @@ def monthly_p_and_i(principal: Decimal, annual_rate_pct: Decimal) -> Decimal:
     return principal * r * factor / (factor - Decimal(1))
 
 def choose_rate(fico: int) -> Decimal:
-    return Decimal("6.125")  # plug your grid later
+    return Decimal("6.125")  # your placeholder grid
 
-# ---------- property type normalization ----------
-PROPERTY_MAP = {
-    # single-family
-    "sfr": "single-family",
-    "sfh": "single-family",
-    "single family": "single-family",
-    "single-family": "single-family",
-    "single family home": "single-family",
-    "single-family home": "single-family",
-    "1 unit": "single-family",
-    "1-unit": "single-family",
-    # 1–4 unit umbrella
-    "2 unit": "1-4 unit", "2-unit": "1-4 unit", "duplex": "1-4 unit",
-    "3 unit": "1-4 unit", "3-unit": "1-4 unit", "triplex": "1-4 unit",
-    "4 unit": "1-4 unit", "4-unit": "1-4 unit", "quadplex": "1-4 unit", "fourplex": "1-4 unit",
-    "1–4 unit": "1-4 unit", "1-4 unit": "1-4 unit",
-    # townhome
-    "townhome": "townhome", "townhouse": "townhome", "town house": "townhome",
-    "th": "townhome", "twnhm": "townhome",
+# ----------------- “Lean AF” property check -----------------
+# Only deny if it smells like condo or manufactured/mobile
+DENY_TOKENS = {
+    "condo", "condominium",
+    "manufactured", "mobile", "mobilehome", "mh", "manuf", "manufactured-home"
 }
-ALLOWED_PROP_TYPES = {"single-family", "townhome", "1-4 unit"}
-def normalize_property_type(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
-    s = raw.strip().lower()
-    if s in PROPERTY_MAP:
-        return PROPERTY_MAP[s]
-    if "single" in s and "family" in s:
-        return "single-family"
-    if "town" in s:
-        return "townhome"
-    if any(tok in s for tok in ["1-4", "1–4", "duplex", "triplex", "quadplex", "fourplex", "2 unit", "3 unit", "4 unit"]):
-        return "1-4 unit"
-    return None
 
-# ---------- models ----------
+def is_denied_property(raw: Optional[str]) -> bool:
+    if not raw:
+        return False
+    s = re.sub(r"\s+", "", raw.strip().lower())
+    return any(tok in s for tok in DENY_TOKENS)
+
+def show_property(raw: Optional[str]) -> str:
+    if not raw:
+        return "unspecified"
+    return raw.strip().title()
+
+# ----------------- Models -----------------
 class QuoteInRaw(BaseModel):
     purchase_price: Optional[str] = None
     down_payment_value: Optional[str] = None
-    down_payment_is_percent: Optional[str] = None  # may be missing
-    fico: Optional[int] = None
+    down_payment_is_percent: Optional[str] = None
+    fico: Optional[str] = None   # accept as string; we coerce
     monthly_taxes: Optional[str] = None
     monthly_insurance: Optional[str] = None
     hoa: Optional[str] = "0"
@@ -134,21 +108,20 @@ class QuoteInRaw(BaseModel):
 class QuoteOut(BaseModel):
     output_markdown: str
 
-# ---------- endpoints ----------
+# ----------------- Endpoints -----------------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
 
 @app.post("/fha-quote", response_model=QuoteOut)
 def fha_quote(payload: QuoteInRaw):
+    # Parse/clean inputs (tolerant, never 500)
     try:
-        # tolerate strings or numbers
         fico_val = int(str(payload.fico).strip()) if payload.fico is not None else None
-
         price = parse_number(payload.purchase_price)
         dp_val = parse_percent_or_number(payload.down_payment_value)
 
-        # infer percent if field is absent/empty: contains "%" OR obvious percent format
+        # infer percent if missing/ambiguous
         dp_is_pct = parse_bool_soft(payload.down_payment_is_percent)
         if dp_is_pct is None:
             raw_dp = (payload.down_payment_value or "").strip().lower()
@@ -156,69 +129,61 @@ def fha_quote(payload: QuoteInRaw):
 
         taxes = parse_number(payload.monthly_taxes)
         ins = parse_number(payload.monthly_insurance)
-        hoa_amt = parse_number(payload.hoa or "0")
+        hoa_amt = parse_number(payload.hoa if payload.hoa is not None else "0")
         lcp = parse_percent_or_number(payload.lender_credit_percent or "0")
-        ptype = normalize_property_type(payload.property_type)
+        denied = is_denied_property(payload.property_type)
     except Exception as e:
         return QuoteOut(output_markdown=f"there was a problem with your inputs: **{e}**")
 
-    # required checks first
+    # Missing-field nudge (don’t crash)
     missing = []
     if fico_val is None: missing.append("credit score")
-    if price == 0: missing.append("purchase price")
+    if price == Decimal("0") and (payload.purchase_price or "") == "": missing.append("purchase price")
     if (payload.down_payment_value or "").strip() == "": missing.append("down payment")
-    if taxes == 0 and (payload.monthly_taxes or "") == "": missing.append("monthly taxes")
-    if ins == 0 and (payload.monthly_insurance or "") == "": missing.append("monthly insurance")
-    if ptype is None: missing.append("property type")
+    if taxes == Decimal("0") and (payload.monthly_taxes or "") == "": missing.append("monthly taxes")
+    if ins == Decimal("0") and (payload.monthly_insurance or "") == "": missing.append("monthly insurance")
+    if (payload.property_type or "").strip() == "": missing.append("property type")
     if missing:
         return QuoteOut(output_markdown=f"i need a bit more info: please provide **{', '.join(missing)}**.")
 
-    # down payment & base loan
+    # Simple guardrails
+    if denied:
+        return QuoteOut(output_markdown=(
+            "🚫 **we don’t quote or originate condos or manufactured/mobile homes.**\n"
+            "i can help right away with single-family, duplex, triplex, quadplex, or townhome."
+        ))
+
     down_payment = q2(price * (dp_val / Decimal("100"))) if dp_is_pct else q2(dp_val)
     base_loan = price - down_payment
 
-    # guardrails
-    if ptype not in ALLOWED_PROP_TYPES:
-        return QuoteOut(
-            output_markdown=(
-                "🚫 **we only quote fha loans for single-family (incl. 1–4 unit) or townhome properties.**\n"
-                "condos & manufactured homes aren’t supported."
-            )
-        )
     if fico_val < 640:
-        return QuoteOut(
-            output_markdown=(
-                "🚫 **minimum fico for this fha quote is 640.**\n"
-                "if your score is 640+ i can re-run the numbers."
-            )
-        )
-    if base_loan < Decimal("150000"):
-        return QuoteOut(
-            output_markdown=(
-                f"🚫 **base loan must be at least {fmt_currency(Decimal('150000'))}.**\n"
-                f"your current base loan is {fmt_currency(base_loan)}."
-            )
-        )
+        return QuoteOut(output_markdown=(
+            "🚫 **minimum fico for this fha quote is 640.**\n"
+            "if your score is 640+ i can re-run the numbers."
+        ))
 
-    # pricing
+    if base_loan < Decimal("150000"):
+        return QuoteOut(output_markdown=(
+            f"🚫 **base loan must be at least {fmt_currency(Decimal('150000'))}.**\n"
+            f"your current base loan is {fmt_currency(base_loan)}."
+        ))
+
+    # Pricing
     ufmip = q2(base_loan * Decimal("0.0175"))
     final_loan = base_loan + ufmip
     rate = choose_rate(fico_val)
 
-    # monthly components
     p_i = monthly_p_and_i(final_loan, rate)
     mip_monthly = final_loan * Decimal("0.0055") / Decimal("12")
     pitia = p_i + mip_monthly + taxes + ins + hoa_amt
 
-    # interim interest (15 days exact; no pre-round)
+    # 15-day interim interest (no pre-round)
     daily_interest = final_loan * (rate / Decimal("100")) / Decimal("365")
     interim_interest = daily_interest * Decimal(15)
 
-    # itemized boxes
+    # Itemized boxes
     box_a = Decimal("0.00")
-    b_appraisal = Decimal("650")
-    b_credit = Decimal("100")
-    b_flood = Decimal("30")
+    b_appraisal, b_credit, b_flood = Decimal("650"), Decimal("100"), Decimal("30")
     box_b = b_appraisal + b_credit + b_flood + ufmip
 
     c_title = Decimal("500")
@@ -226,8 +191,7 @@ def fha_quote(payload: QuoteInRaw):
     c_survey = Decimal("300")
     box_c = c_title + c_lender_title + c_survey
 
-    e_recording = Decimal("299")
-    e_transfer = c_lender_title
+    e_recording, e_transfer = Decimal("299"), c_lender_title
     box_e = e_recording + e_transfer
 
     box_f = (ins * Decimal("12")) + interim_interest
@@ -235,20 +199,19 @@ def fha_quote(payload: QuoteInRaw):
 
     total_closing_costs = box_a + box_b + box_c + box_e + box_f + box_g
 
-    # lender credit (0/1/2/3%)
+    # Lender credit (0/1/2/3 % of final_loan)
     lender_credit_amt = q2(final_loan * (lcp / Decimal("100")))
     total_after_credit = total_closing_costs - lender_credit_amt
-    if total_after_credit < Decimal("0"):
+    if total_after_credit < 0:
         total_after_credit = Decimal("0")
 
     cash_to_close = down_payment + total_after_credit
     if cash_to_close < down_payment:
         cash_to_close = down_payment
 
-    # APR = note rate + 1.06%
+    # APR: note rate + 1.06%
     apr_est = q2(rate + Decimal("1.06"))
-
-    shown_ptype = "Single-family" if ptype == "single-family" else ("Townhome" if ptype == "townhome" else "1–4 unit")
+    shown_ptype = show_property(payload.property_type)
 
     md = f"""
 🧾 **FHA Loan Estimate — govies.com**
