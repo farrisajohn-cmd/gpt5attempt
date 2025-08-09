@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
@@ -22,11 +22,6 @@ def fmt_currency(val: Decimal) -> str:
     return f"${_q2(val):,}"
 
 def parse_number(x) -> Decimal:
-    """
-    Accepts things like:
-      '$350k', '350k', '350,000', '1.2m', '100', '100.50', 'no', 'none'
-    Returns Decimal(…)
-    """
     if x is None:
         return Decimal("0")
     if isinstance(x, (int, float, Decimal)):
@@ -75,31 +70,24 @@ def monthly_p_and_i(principal: Decimal, annual_rate_pct: Decimal) -> Decimal:
     return principal * r * factor / (factor - Decimal(1))
 
 def choose_rate(fico: int) -> Decimal:
-    return Decimal("6.125")  # update if needed
+    return Decimal("6.125")  # update if you want rate table
 
-# ---------- endpoint ----------
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
-
-@app.get("/fha-quote")
-def fha_quote(
-    purchase_price: str = Query(..., description="e.g. 350000, $350k, 1.2m"),
-    down_payment_value: str = Query(..., description="e.g. 10% or 35000"),
-    down_payment_is_percent: str = Query(..., description="true/false, yes/no"),
-    fico: int = Query(...),
-    monthly_taxes: str = Query(..., description="e.g. 350 or $350"),
-    monthly_insurance: str = Query(..., description="e.g. 100 or $100"),
-    hoa: Optional[str] = Query("0", description="e.g. 0, no, or $50"),
-    property_type: str = Query(..., description="single-family, townhome, 1–4 unit"),
-    lender_credit_percent: Optional[str] = Query("0", description="0/1/2/3"),
+# ---------- core FHA logic ----------
+def _fha_quote_core(
+    purchase_price,
+    down_payment_value,
+    down_payment_is_percent,
+    fico,
+    monthly_taxes,
+    monthly_insurance,
+    hoa,
+    property_type,
+    lender_credit_percent
 ):
-    # ---- tolerant parsing ----
     try:
         price = parse_number(purchase_price)
-        dp_val_raw = down_payment_value
         dp_is_pct = parse_bool(down_payment_is_percent)
-        dp_val = parse_percent_or_number(dp_val_raw)
+        dp_val = parse_percent_or_number(down_payment_value)
         taxes = parse_number(monthly_taxes)
         ins = parse_number(monthly_insurance)
         hoa_amt = parse_number(hoa)
@@ -107,11 +95,9 @@ def fha_quote(
     except Exception as e:
         return {"output_markdown": f"there was a problem with your inputs: {e}"}
 
-    # compute down payment and base loan
     down_payment = _q2(price * (dp_val / Decimal("100"))) if dp_is_pct else _q2(dp_val)
     base_loan = price - down_payment
 
-    # ---- GUARDRAILS ----
     allowed = {
         "single-family", "single family", "sfr",
         "townhome", "townhouse", "rowhome",
@@ -136,21 +122,17 @@ def fha_quote(
             f"your current base loan is {fmt_currency(base_loan)}."
         )}
 
-    # ---- pricing ----
     ufmip = _q2(base_loan * Decimal("0.0175"))
     final_loan = base_loan + ufmip
     rate = choose_rate(fico)
 
-    # monthly pieces
     p_i = monthly_p_and_i(final_loan, rate)
     mip_monthly = final_loan * Decimal("0.0055") / Decimal("12")
     pitia = p_i + mip_monthly + taxes + ins + hoa_amt
 
-    # interim interest (15 days exact)
     daily_interest = final_loan * (rate / Decimal("100")) / Decimal("365")
     interim_interest = daily_interest * Decimal(15)
 
-    # boxes
     box_a = Decimal("0.00")
     b_appraisal, b_credit, b_flood = Decimal("650"), Decimal("100"), Decimal("30")
     box_b = b_appraisal + b_credit + b_flood + ufmip
@@ -168,7 +150,6 @@ def fha_quote(
 
     total_closing_costs = box_a + box_b + box_c + box_e + box_f + box_g
 
-    # lender credit
     lender_credit_amt = _q2(final_loan * (lcp / Decimal("100")))
     total_after_credit = total_closing_costs - lender_credit_amt
     if total_after_credit < Decimal("0"):
@@ -178,10 +159,8 @@ def fha_quote(
     if cash_to_close < down_payment:
         cash_to_close = down_payment
 
-    # APR
     apr_est = (rate + Decimal("1.06")).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
 
-    # output
     md = f"""
 🧾 **FHA Loan Estimate — govies.com**
 
@@ -232,3 +211,47 @@ your actual rate, payment, and costs could be higher. get an official loan estim
 """.strip()
 
     return {"output_markdown": md}
+
+# ---------- endpoints ----------
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
+@app.get("/fha-quote")
+def fha_quote_get(
+    purchase_price: str = Query(...),
+    down_payment_value: str = Query(...),
+    down_payment_is_percent: str = Query(...),
+    fico: int = Query(...),
+    monthly_taxes: str = Query(...),
+    monthly_insurance: str = Query(...),
+    hoa: Optional[str] = Query("0"),
+    property_type: str = Query(...),
+    lender_credit_percent: Optional[str] = Query("0"),
+):
+    return _fha_quote_core(
+        purchase_price,
+        down_payment_value,
+        down_payment_is_percent,
+        fico,
+        monthly_taxes,
+        monthly_insurance,
+        hoa,
+        property_type,
+        lender_credit_percent
+    )
+
+@app.post("/fha-quote")
+async def fha_quote_post(req: Request):
+    data = await req.json()
+    return _fha_quote_core(
+        data.get("purchase_price"),
+        data.get("down_payment_value"),
+        data.get("down_payment_is_percent"),
+        data.get("fico"),
+        data.get("monthly_taxes"),
+        data.get("monthly_insurance"),
+        data.get("hoa", "0"),
+        data.get("property_type"),
+        data.get("lender_credit_percent", "0")
+    )
